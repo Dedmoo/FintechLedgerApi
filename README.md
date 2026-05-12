@@ -197,3 +197,5 @@ Coverage focuses on balanced posting, insufficient funds, currency checks, idemp
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+<!-- docs: maintenance pass 2026-05-12 -->
