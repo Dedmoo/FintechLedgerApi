@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="FintechLedger.Api/FintechLedger.Api.csproj" />
+  <Project Path="FintechLedger.Tests/FintechLedger.Tests.csproj" />
+</Solution>
