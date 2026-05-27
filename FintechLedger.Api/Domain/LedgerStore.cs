@@ -52,16 +52,19 @@ public sealed class LedgerStore
 
         lock (_gate)
         {
-            if (!string.IsNullOrWhiteSpace(request.IdempotencyKey)
-                && _idempotency.TryGetValue(request.IdempotencyKey, out var existingEntryId))
+            if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
             {
-                var existing = _entries.First(e => e.EntryId == existingEntryId);
-                var accountId = request.AccountId;
-                return new TransferResult(
-                    existing.EntryId,
-                    BalanceUnlocked(SystemClearingId(EnsureAccount(accountId).Currency)),
-                    BalanceUnlocked(accountId),
-                    Replayed: true);
+                var fundKey = "fund:" + request.IdempotencyKey;
+                if (_idempotency.TryGetValue(fundKey, out var existingEntryId))
+                {
+                    var existing = _entries.First(e => e.EntryId == existingEntryId);
+                    var accountId = request.AccountId;
+                    return new TransferResult(
+                        existing.EntryId,
+                        BalanceUnlocked(SystemClearingId(EnsureAccount(accountId).Currency)),
+                        BalanceUnlocked(accountId),
+                        Replayed: true);
+                }
             }
 
             var account = EnsureAccount(request.AccountId);
@@ -84,7 +87,7 @@ public sealed class LedgerStore
 
             _entries.Add(entry);
             if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
-                _idempotency[request.IdempotencyKey!] = entry.EntryId;
+                _idempotency["fund:" + request.IdempotencyKey!] = entry.EntryId;
 
             WriteAudit(
                 "account.funded",
@@ -108,15 +111,18 @@ public sealed class LedgerStore
 
         lock (_gate)
         {
-            if (!string.IsNullOrWhiteSpace(request.IdempotencyKey)
-                && _idempotency.TryGetValue(request.IdempotencyKey, out var existingEntryId))
+            if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
             {
-                var existing = _entries.First(e => e.EntryId == existingEntryId);
-                return new TransferResult(
-                    existing.EntryId,
-                    BalanceUnlocked(request.FromAccountId),
-                    BalanceUnlocked(request.ToAccountId),
-                    Replayed: true);
+                var xferKey = "xfer:" + request.IdempotencyKey;
+                if (_idempotency.TryGetValue(xferKey, out var existingEntryId))
+                {
+                    var existing = _entries.First(e => e.EntryId == existingEntryId);
+                    return new TransferResult(
+                        existing.EntryId,
+                        BalanceUnlocked(request.FromAccountId),
+                        BalanceUnlocked(request.ToAccountId),
+                        Replayed: true);
+                }
             }
 
             var from = EnsureAccount(request.FromAccountId);
@@ -148,7 +154,7 @@ public sealed class LedgerStore
 
             _entries.Add(entry);
             if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
-                _idempotency[request.IdempotencyKey!] = entry.EntryId;
+                _idempotency["xfer:" + request.IdempotencyKey!] = entry.EntryId;
 
             WriteAudit(
                 "transfer.posted",

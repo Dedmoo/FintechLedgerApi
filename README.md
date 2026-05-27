@@ -26,7 +26,7 @@ sequenceDiagram
     Client->>API: POST /api/transfers
     API->>Store: Transfer(request)
     Store->>Store: Validate accounts + currency
-    Store->>Store: Check funds (unless opening entry)
+    Store->>Store: Check sufficient funds
     Store->>Store: Post balanced debit/credit
     Store->>Store: Write audit event
     Store-->>API: Balances + entryId
