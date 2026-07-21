@@ -46,6 +46,84 @@ Retail and corporate banking platforms rely on balanced journals, safe retries, 
 - Append-only audit events
 - OpenAPI document at `/openapi/v1.json`
 
+## Domain model
+
+Class-level view of the main types and how they relate (fields, operations and dependencies).
+
+```mermaid
+classDiagram
+    direction TB
+    class LedgerStore {
+        -_accounts: Dictionary~string, Account~
+        -_entries: List~JournalEntry~
+        -_idempotency: Dictionary~string, string~
+        -_audit: List~AuditEvent~
+        +CreateAccount(ownerName, currency) Account
+        +GetAccount(accountId) Account
+        +GetBalance(accountId) decimal
+        +Fund(request) TransferResult
+        +Transfer(request) TransferResult
+        +GetStatement(accountId) List~JournalEntry~
+        +GetAuditTrail() List~AuditEvent~
+        +IsLedgerBalanced() bool
+    }
+    class Account {
+        +AccountId: string
+        +OwnerName: string
+        +Currency: string
+        +CreatedAt: DateTimeOffset
+    }
+    class LedgerLine {
+        +AccountId: string
+        +Debit: decimal
+        +Credit: decimal
+    }
+    class JournalEntry {
+        +EntryId: string
+        +Description: string
+        +PostedAt: DateTimeOffset
+        +Lines: List~LedgerLine~
+        +IdempotencyKey: string
+    }
+    class AuditEvent {
+        +EventId: string
+        +Action: string
+        +Details: string
+        +OccurredAt: DateTimeOffset
+    }
+    class CreateAccountRequest {
+        +OwnerName: string
+        +Currency: string
+    }
+    class FundAccountRequest {
+        +AccountId: string
+        +Amount: decimal
+        +Description: string
+        +IdempotencyKey: string
+    }
+    class TransferRequest {
+        +FromAccountId: string
+        +ToAccountId: string
+        +Amount: decimal
+        +Description: string
+        +IdempotencyKey: string
+    }
+    class TransferResult {
+        +EntryId: string
+        +FromBalance: decimal
+        +ToBalance: decimal
+        +Replayed: bool
+    }
+    LedgerStore o-- Account
+    LedgerStore o-- JournalEntry
+    LedgerStore o-- AuditEvent
+    JournalEntry *-- LedgerLine
+    LedgerStore ..> CreateAccountRequest
+    LedgerStore ..> FundAccountRequest
+    LedgerStore ..> TransferRequest
+    LedgerStore ..> TransferResult
+```
+
 ## Quick start
 
 ```bash
