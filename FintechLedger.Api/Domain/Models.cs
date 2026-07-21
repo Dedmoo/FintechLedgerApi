@@ -34,13 +34,18 @@ public sealed class AuditEvent
 
 public sealed record CreateAccountRequest(string OwnerName, string Currency = "TRY");
 
+public sealed record FundAccountRequest(
+    string AccountId,
+    decimal Amount,
+    string? Description = null,
+    string? IdempotencyKey = null);
+
 public sealed record TransferRequest(
     string FromAccountId,
     string ToAccountId,
     decimal Amount,
     string? Description = null,
-    string? IdempotencyKey = null,
-    bool AllowNegativeSource = false);
+    string? IdempotencyKey = null);
 
 public sealed record TransferResult(
     string EntryId,

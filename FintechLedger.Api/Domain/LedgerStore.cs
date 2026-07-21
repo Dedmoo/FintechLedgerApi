@@ -44,6 +44,60 @@ public sealed class LedgerStore
         }
     }
 
+    public TransferResult Fund(FundAccountRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (request.Amount <= 0)
+            throw new InvalidOperationException("Funding amount must be greater than zero.");
+
+        lock (_gate)
+        {
+            if (!string.IsNullOrWhiteSpace(request.IdempotencyKey)
+                && _idempotency.TryGetValue(request.IdempotencyKey, out var existingEntryId))
+            {
+                var existing = _entries.First(e => e.EntryId == existingEntryId);
+                var accountId = request.AccountId;
+                return new TransferResult(
+                    existing.EntryId,
+                    BalanceUnlocked(SystemClearingId(EnsureAccount(accountId).Currency)),
+                    BalanceUnlocked(accountId),
+                    Replayed: true);
+            }
+
+            var account = EnsureAccount(request.AccountId);
+            var clearingId = EnsureSystemClearing(account.Currency);
+
+            var entry = new JournalEntry
+            {
+                EntryId = $"JE-{Guid.NewGuid():N}"[..18].ToUpperInvariant(),
+                Description = string.IsNullOrWhiteSpace(request.Description)
+                    ? $"Opening deposit {account.AccountId}"
+                    : request.Description.Trim(),
+                PostedAt = DateTimeOffset.UtcNow,
+                IdempotencyKey = request.IdempotencyKey,
+                Lines =
+                [
+                    new LedgerLine { AccountId = clearingId, Debit = 0m, Credit = request.Amount },
+                    new LedgerLine { AccountId = account.AccountId, Debit = request.Amount, Credit = 0m }
+                ]
+            };
+
+            _entries.Add(entry);
+            if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
+                _idempotency[request.IdempotencyKey!] = entry.EntryId;
+
+            WriteAudit(
+                "account.funded",
+                $"entryId={entry.EntryId}; accountId={account.AccountId}; amount={request.Amount}");
+
+            return new TransferResult(
+                entry.EntryId,
+                BalanceUnlocked(clearingId),
+                BalanceUnlocked(account.AccountId),
+                Replayed: false);
+        }
+    }
+
     public TransferResult Transfer(TransferRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -71,7 +125,7 @@ public sealed class LedgerStore
                 throw new InvalidOperationException("Currency mismatch between accounts.");
 
             var fromBalance = BalanceUnlocked(from.AccountId);
-            if (!request.AllowNegativeSource && fromBalance < request.Amount)
+            if (fromBalance < request.Amount)
                 throw new InvalidOperationException("Insufficient funds.");
 
             var entry = new JournalEntry
@@ -150,6 +204,26 @@ public sealed class LedgerStore
         if (!_accounts.TryGetValue(accountId, out var account))
             throw new KeyNotFoundException($"Account not found: {accountId}");
         return account;
+    }
+
+    private static string SystemClearingId(string currency) =>
+        $"SYS-CLEARING-{currency.Trim().ToUpperInvariant()}";
+
+    private string EnsureSystemClearing(string currency)
+    {
+        var id = SystemClearingId(currency);
+        if (!_accounts.ContainsKey(id))
+        {
+            _accounts[id] = new Account
+            {
+                AccountId = id,
+                OwnerName = "System Clearing",
+                Currency = currency.Trim().ToUpperInvariant()
+            };
+            WriteAudit("account.created", $"accountId={id}; owner=System Clearing");
+        }
+
+        return id;
     }
 
     private void WriteAudit(string action, string details)

@@ -54,22 +54,24 @@ dotnet test
 dotnet run --project FintechLedger.Api
 ```
 
-API base URL: `https://localhost:7xxx` (see console output) or `http://localhost:5xxx`.
+API base URL (HTTP): `http://localhost:5182`
 
 ## Example flow
 
 ```bash
-# 1) Create clearing + customer accounts
-curl -s -X POST http://localhost:5080/api/accounts -H "Content-Type: application/json" -d "{\"ownerName\":\"Clearing\",\"currency\":\"TRY\"}"
-curl -s -X POST http://localhost:5080/api/accounts -H "Content-Type: application/json" -d "{\"ownerName\":\"Alice\",\"currency\":\"TRY\"}"
+# 1) Create a customer account
+curl -s -X POST http://localhost:5182/api/accounts -H "Content-Type: application/json" -d "{\"ownerName\":\"Alice\",\"currency\":\"TRY\"}"
 
-# 2) Open Alice balance from clearing
-curl -s -X POST http://localhost:5080/api/transfers -H "Content-Type: application/json" -d "{\"fromAccountId\":\"ACC-...\",\"toAccountId\":\"ACC-...\",\"amount\":1000,\"description\":\"Opening\",\"idempotencyKey\":\"open-alice-1\"}"
+# 2) Fund Alice from the internal system clearing account
+curl -s -X POST http://localhost:5182/api/accounts/ACC-.../fund -H "Content-Type: application/json" -d "{\"amount\":1000,\"description\":\"Opening\",\"idempotencyKey\":\"open-alice-1\"}"
 
-# 3) Read balance / statement / audit
-curl -s http://localhost:5080/api/accounts/ACC-.../balance
-curl -s http://localhost:5080/api/accounts/ACC-.../statement
-curl -s http://localhost:5080/api/audit
+# 3) Transfer between funded accounts
+curl -s -X POST http://localhost:5182/api/transfers -H "Content-Type: application/json" -d "{\"fromAccountId\":\"ACC-...\",\"toAccountId\":\"ACC-...\",\"amount\":120,\"description\":\"Payment\",\"idempotencyKey\":\"pay-1\"}"
+
+# 4) Read balance / statement / audit
+curl -s http://localhost:5182/api/accounts/ACC-.../balance
+curl -s http://localhost:5182/api/accounts/ACC-.../statement
+curl -s http://localhost:5182/api/audit
 ```
 
 ## API overview
@@ -79,7 +81,8 @@ curl -s http://localhost:5080/api/audit
 | `POST` | `/api/accounts` | Create account |
 | `GET` | `/api/accounts/{id}` | Get account |
 | `GET` | `/api/accounts/{id}/balance` | Current balance |
-| `POST` | `/api/transfers` | Post transfer |
+| `POST` | `/api/accounts/{id}/fund` | Opening deposit via system clearing |
+| `POST` | `/api/transfers` | Post transfer (rejects insufficient funds) |
 | `GET` | `/api/accounts/{id}/statement` | Journal lines for account |
 | `GET` | `/api/audit` | Audit trail |
 | `GET` | `/health` | Health check |
@@ -92,12 +95,11 @@ curl -s http://localhost:5080/api/audit
   "toAccountId": "ACC-YYYYYYYY",
   "amount": 120.50,
   "description": "Invoice 42",
-  "idempotencyKey": "client-retry-key-1",
-  "allowNegativeSource": false
+  "idempotencyKey": "client-retry-key-1"
 }
 ```
 
-Set `allowNegativeSource` to `true` only for controlled opening / clearing entries.
+Opening balances go through `POST /api/accounts/{id}/fund`, which posts against an internal system clearing account. Customer-to-customer transfers always enforce sufficient funds.
 
 ## Design notes
 

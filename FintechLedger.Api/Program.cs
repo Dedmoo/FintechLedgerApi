@@ -44,6 +44,24 @@ app.MapGet("/api/accounts/{accountId}/balance", (string accountId, LedgerStore s
     }
 });
 
+app.MapPost("/api/accounts/{accountId}/fund", (string accountId, FundAccountRequest request, LedgerStore store) =>
+{
+    try
+    {
+        var body = request with { AccountId = accountId };
+        var result = store.Fund(body);
+        return Results.Ok(result);
+    }
+    catch (KeyNotFoundException ex)
+    {
+        return Results.NotFound(new { error = ex.Message });
+    }
+    catch (InvalidOperationException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+});
+
 app.MapPost("/api/transfers", (TransferRequest request, LedgerStore store) =>
 {
     try
