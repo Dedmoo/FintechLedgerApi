@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FintechLedgerApi — documentation</title>
+  <style>
+    :root { --bg:#0f1419; --card:#1a222c; --text:#e7eef7; --muted:#9fb0c3; --accent:#3d9cfd; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:"Segoe UI", system-ui, sans-serif; background:linear-gradient(160deg,#0f1419,#152033); color:var(--text); }
+    main { max-width:920px; margin:0 auto; padding:3rem 1.25rem 4rem; }
+    h1 { font-size:2rem; margin:0 0 .5rem; }
+    p.lead { color:var(--muted); font-size:1.05rem; line-height:1.55; }
+    .grid { display:grid; gap:1rem; margin-top:2rem; }
+    @media (min-width:720px) { .grid { grid-template-columns:1fr 1fr; } }
+    article { background:var(--card); border:1px solid #2a3644; border-radius:12px; padding:1.25rem 1.35rem; }
+    article h2 { margin:0 0 .6rem; font-size:1.1rem; }
+    article p { margin:0; color:var(--muted); line-height:1.5; font-size:.95rem; }
+    a { color:var(--accent); text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    footer { margin-top:2.5rem; color:var(--muted); font-size:.85rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>FintechLedgerApi</h1>
+    <p class="lead">Double-entry ledger sample with running balances, payload-bound idempotency, append-only reversals, and a hash-chained audit trail. In-memory storage by design.</p>
+    <div class="grid">
+      <article>
+        <h2>Architecture</h2>
+        <p>Context, containers, components, and threat notes. <a href="architecture.md">architecture.md</a></p>
+      </article>
+      <article>
+        <h2>UML</h2>
+        <p>Class responsibilities and reverse-entry sequence. <a href="uml.md">uml.md</a></p>
+      </article>
+      <article>
+        <h2>API surface</h2>
+        <p>See the repository <a href="../README.md">README</a> for routes and curl examples. OpenAPI at <code>/openapi/v1.json</code> when the API is running.</p>
+      </article>
+      <article>
+        <h2>Verification</h2>
+        <p>Run <code>dotnet test</code> for domain and HTTP security checks (headers, validation, end-to-end posting).</p>
+      </article>
+    </div>
+    <footer>Mehmet Serin — portfolio sample for banking domain discussion.</footer>
+  </main>
+</body>
+</html>

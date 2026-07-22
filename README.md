@@ -1,22 +1,43 @@
-# Fintech Ledger API
+# FintechLedgerApi
 
-Double-entry ledger microservice for account balances, money transfers, idempotent posting, and audit trails.
+Double-entry ledger HTTP service for opening accounts, funding via a system clearing account, posting transfers, issuing statements with running balances, reversing mistakes without rewriting history, and verifying a hash-chained audit trail.
 
-Built with **.NET 10** and Minimal APIs. Storage is in-memory so the project runs with zero infrastructure while still demonstrating core banking ledger rules.
+Stack: **.NET 10**, ASP.NET Core Minimal APIs. Persistence is **in-memory** so the sample runs without Docker or a database. Treat it as a domain demo, not a production ledger.
+
+## Scope (honest)
+
+| Capability | Status |
+|------------|--------|
+| Balanced debit/credit journals | Implemented |
+| Idempotent fund/transfer/reverse (payload-bound keys) | Implemented |
+| ISO 4217 allow-list on account open | Implemented (common codes) |
+| Statement lines with running balance | Implemented |
+| Append-only reversal | Implemented |
+| Tamper-evident audit hash chain | Implemented (in-process) |
+| Durable storage / multi-node | Not included |
+| FX conversion | Not included |
 
 ## Architecture
 
 ```mermaid
-flowchart TD
-    Client["Client / Channel"] -->|HTTP JSON| API["FintechLedger.Api<br/>Minimal API"]
-    API --> Store["LedgerStore<br/>double-entry engine"]
-    Store --> Journal[("Journal entries<br/>+ ledger lines")]
-    Store --> Audit[("Append-only<br/>audit events")]
-    Store --> Idem[("Idempotency map<br/>safe retries")]
-    Journal --> Balance["Balance = Σ debit − Σ credit"]
+flowchart TB
+    subgraph context
+      Channel[Channel / back-office]
+      Ledger[FintechLedgerApi]
+    end
+    Channel -->|HTTPS JSON| Ledger
 ```
 
-Transfer flow:
+```mermaid
+flowchart LR
+    Client --> API[FintechLedger.Api]
+    API --> Store[LedgerStore]
+    Store --> J[(Journal)]
+    Store --> A[(Audit chain)]
+    Store --> I[(Idempotency map)]
+```
+
+Sequence for a customer transfer:
 
 ```mermaid
 sequenceDiagram
@@ -24,104 +45,43 @@ sequenceDiagram
     participant API as FintechLedger.Api
     participant Store as LedgerStore
     Client->>API: POST /api/transfers
-    API->>Store: Transfer(request)
-    Store->>Store: Validate accounts + currency
-    Store->>Store: Check sufficient funds
-    Store->>Store: Post balanced debit/credit
-    Store->>Store: Write audit event
-    Store-->>API: Balances + entryId
-    API-->>Client: 200 OK
+    API->>Store: Transfer
+    Store->>Store: Validate currency, funds, idempotency
+    Store->>Store: Post balanced lines
+    Store->>Store: Append audit hash
+    Store-->>API: balances + entryId
+    API-->>Client: 200
 ```
-
-## Why this project
-
-Retail and corporate banking platforms rely on balanced journals, safe retries, and immutable audit history. This repository shows those building blocks in a compact, testable API.
-
-## Features
-
-- Account opening (`TRY` / `USD` / other ISO currency codes)
-- Double-entry transfers (every debit has a matching credit)
-- Idempotency keys for safe client retries
-- Account statement and running balance
-- Append-only audit events
-- OpenAPI document at `/openapi/v1.json`
 
 ## Domain model
 
-Class-level view of the main types and how they relate (fields, operations and dependencies).
-
 ```mermaid
 classDiagram
-    direction TB
     class LedgerStore {
-        -_accounts: Dictionary~string, Account~
-        -_entries: List~JournalEntry~
-        -_idempotency: Dictionary~string, string~
-        -_audit: List~AuditEvent~
-        +CreateAccount(ownerName, currency) Account
-        +GetAccount(accountId) Account
-        +GetBalance(accountId) decimal
-        +Fund(request) TransferResult
-        +Transfer(request) TransferResult
-        +GetStatement(accountId) List~JournalEntry~
-        +GetAuditTrail() List~AuditEvent~
-        +IsLedgerBalanced() bool
-    }
-    class Account {
-        +AccountId: string
-        +OwnerName: string
-        +Currency: string
-        +CreatedAt: DateTimeOffset
-    }
-    class LedgerLine {
-        +AccountId: string
-        +Debit: decimal
-        +Credit: decimal
+        +CreateAccount()
+        +Fund()
+        +Transfer()
+        +Reverse()
+        +GetStatement()
+        +VerifyAuditChain()
     }
     class JournalEntry {
-        +EntryId: string
-        +Description: string
-        +PostedAt: DateTimeOffset
-        +Lines: List~LedgerLine~
-        +IdempotencyKey: string
+        +EntryId
+        +Lines
+        +ReversesEntryId
+    }
+    class StatementLine {
+        +Debit
+        +Credit
+        +RunningBalance
     }
     class AuditEvent {
-        +EventId: string
-        +Action: string
-        +Details: string
-        +OccurredAt: DateTimeOffset
+        +PreviousHash
+        +EventHash
     }
-    class CreateAccountRequest {
-        +OwnerName: string
-        +Currency: string
-    }
-    class FundAccountRequest {
-        +AccountId: string
-        +Amount: decimal
-        +Description: string
-        +IdempotencyKey: string
-    }
-    class TransferRequest {
-        +FromAccountId: string
-        +ToAccountId: string
-        +Amount: decimal
-        +Description: string
-        +IdempotencyKey: string
-    }
-    class TransferResult {
-        +EntryId: string
-        +FromBalance: decimal
-        +ToBalance: decimal
-        +Replayed: bool
-    }
-    LedgerStore o-- Account
     LedgerStore o-- JournalEntry
     LedgerStore o-- AuditEvent
-    JournalEntry *-- LedgerLine
-    LedgerStore ..> CreateAccountRequest
-    LedgerStore ..> FundAccountRequest
-    LedgerStore ..> TransferRequest
-    LedgerStore ..> TransferResult
+    JournalEntry --> StatementLine : projects to
 ```
 
 ## Quick start
@@ -132,67 +92,37 @@ dotnet test
 dotnet run --project FintechLedger.Api
 ```
 
-API base URL (HTTP): `http://localhost:5182`
+Base URL: `http://localhost:5182`  
+OpenAPI: `/openapi/v1.json`
 
-## Example flow
+## API
 
-```bash
-# 1) Create a customer account
-curl -s -X POST http://localhost:5182/api/accounts -H "Content-Type: application/json" -d "{\"ownerName\":\"Alice\",\"currency\":\"TRY\"}"
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/api/accounts` | ISO 4217 currency required |
+| GET | `/api/accounts/{id}` | |
+| GET | `/api/accounts/{id}/balance` | Derived: Σdebit − Σcredit |
+| POST | `/api/accounts/{id}/fund` | Against `SYS-CLEARING-{CCY}` |
+| POST | `/api/transfers` | Same-currency, sufficient funds |
+| POST | `/api/journal/reverse` | New reversing entry only |
+| GET | `/api/accounts/{id}/statement` | Newest first, running balance |
+| GET | `/api/audit` | Hash-chained events |
+| GET | `/api/audit/verify` | Chain + global balance check |
+| GET | `/health` | |
 
-# 2) Fund Alice from the internal system clearing account
-curl -s -X POST http://localhost:5182/api/accounts/ACC-.../fund -H "Content-Type: application/json" -d "{\"amount\":1000,\"description\":\"Opening\",\"idempotencyKey\":\"open-alice-1\"}"
+Reusing an idempotency key with a **different** amount or account set returns `400`.
 
-# 3) Transfer between funded accounts
-curl -s -X POST http://localhost:5182/api/transfers -H "Content-Type: application/json" -d "{\"fromAccountId\":\"ACC-...\",\"toAccountId\":\"ACC-...\",\"amount\":120,\"description\":\"Payment\",\"idempotencyKey\":\"pay-1\"}"
-
-# 4) Read balance / statement / audit
-curl -s http://localhost:5182/api/accounts/ACC-.../balance
-curl -s http://localhost:5182/api/accounts/ACC-.../statement
-curl -s http://localhost:5182/api/audit
-```
-
-## API overview
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/accounts` | Create account |
-| `GET` | `/api/accounts/{id}` | Get account |
-| `GET` | `/api/accounts/{id}/balance` | Current balance |
-| `POST` | `/api/accounts/{id}/fund` | Opening deposit via system clearing |
-| `POST` | `/api/transfers` | Post transfer (rejects insufficient funds) |
-| `GET` | `/api/accounts/{id}/statement` | Journal lines for account |
-| `GET` | `/api/audit` | Audit trail |
-| `GET` | `/health` | Health check |
-
-### Transfer body
-
-```json
-{
-  "fromAccountId": "ACC-XXXXXXXX",
-  "toAccountId": "ACC-YYYYYYYY",
-  "amount": 120.50,
-  "description": "Invoice 42",
-  "idempotencyKey": "client-retry-key-1"
-}
-```
-
-Opening balances go through `POST /api/accounts/{id}/fund`, which posts against an internal system clearing account. Customer-to-customer transfers always enforce sufficient funds.
-
-## Design notes
-
-- Balance formula: `sum(debit) - sum(credit)`
-- A transfer credits the source account and debits the destination account in one journal entry
-- Replaying the same `idempotencyKey` returns the original entry without posting twice
-- Currency mismatch and insufficient funds are rejected with clear errors
-
-## Tests
+## Verification
 
 ```bash
 dotnet test
 ```
 
-Coverage focuses on balanced posting, insufficient funds, currency checks, idempotent retries, and audit emission.
+Includes domain tests (balance, reverse, currency, idempotency conflict) and HTTP tests (security headers, OpenAPI, end-to-end posting, oversized body).
+
+## Documentation site
+
+Open [docs/index.html](docs/index.html) for the C4/UML overview page. Longer notes: [docs/architecture.md](docs/architecture.md), [docs/uml.md](docs/uml.md).
 
 ## License
 

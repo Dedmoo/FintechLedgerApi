@@ -3,14 +3,20 @@ using FintechLedger.Api.Domain;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddOpenApi();
 builder.Services.AddSingleton<LedgerStore>();
+builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 64 * 1024);
 
 var app = builder.Build();
 
-if (app.Environment.IsDevelopment())
+app.Use(async (context, next) =>
 {
-    app.MapOpenApi();
-}
+    context.Response.Headers["X-Content-Type-Options"] = "nosniff";
+    context.Response.Headers["X-Frame-Options"] = "DENY";
+    context.Response.Headers["Referrer-Policy"] = "no-referrer";
+    context.Response.Headers["Cache-Control"] = "no-store";
+    await next();
+});
 
+app.MapOpenApi();
 app.MapGet("/", () => Results.Redirect("/openapi/v1.json"));
 
 app.MapPost("/api/accounts", (CreateAccountRequest request, LedgerStore store) =>
@@ -21,6 +27,10 @@ app.MapPost("/api/accounts", (CreateAccountRequest request, LedgerStore store) =
         return Results.Created($"/api/accounts/{account.AccountId}", account);
     }
     catch (ArgumentException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+    catch (InvalidOperationException ex)
     {
         return Results.BadRequest(new { error = ex.Message });
     }
@@ -49,8 +59,7 @@ app.MapPost("/api/accounts/{accountId}/fund", (string accountId, FundAccountRequ
     try
     {
         var body = request with { AccountId = accountId };
-        var result = store.Fund(body);
-        return Results.Ok(result);
+        return Results.Ok(store.Fund(body));
     }
     catch (KeyNotFoundException ex)
     {
@@ -66,8 +75,23 @@ app.MapPost("/api/transfers", (TransferRequest request, LedgerStore store) =>
 {
     try
     {
-        var result = store.Transfer(request);
-        return Results.Ok(result);
+        return Results.Ok(store.Transfer(request));
+    }
+    catch (KeyNotFoundException ex)
+    {
+        return Results.NotFound(new { error = ex.Message });
+    }
+    catch (InvalidOperationException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+});
+
+app.MapPost("/api/journal/reverse", (ReverseEntryRequest request, LedgerStore store) =>
+{
+    try
+    {
+        return Results.Ok(store.Reverse(request));
     }
     catch (KeyNotFoundException ex)
     {
@@ -93,7 +117,10 @@ app.MapGet("/api/accounts/{accountId}/statement", (string accountId, LedgerStore
 
 app.MapGet("/api/audit", (LedgerStore store) => Results.Ok(store.GetAuditTrail()));
 
-app.MapGet("/health", () => Results.Ok(new { status = "healthy", service = "fintech-ledger-api" }));
+app.MapGet("/api/audit/verify", (LedgerStore store) =>
+    Results.Ok(new { intact = store.VerifyAuditChain(), balanced = store.IsLedgerBalanced() }));
+
+app.MapGet("/health", () => Results.Ok(new { status = "healthy", service = "FintechLedgerApi" }));
 
 app.Run();
 
