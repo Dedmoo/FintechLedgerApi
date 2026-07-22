@@ -1,11 +1,28 @@
+using FintechLedger.Api.Data;
 using FintechLedger.Api.Domain;
+using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
+var contentRootPath = builder.Environment.ContentRootPath;
+
 builder.Services.AddOpenApi();
-builder.Services.AddSingleton<LedgerStore>();
+builder.Services.AddDbContext<LedgerDbContext>((sp, options) =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+    var connectionString = configuration.GetConnectionString("LedgerDb") ?? "Data Source=fintechledger.db";
+    options.UseSqlite(ResolveSqliteConnectionString(connectionString, contentRootPath));
+});
+builder.Services.AddScoped<LedgerStore>();
 builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 64 * 1024);
 
 var app = builder.Build();
+
+using (var startupScope = app.Services.CreateScope())
+{
+    var db = startupScope.ServiceProvider.GetRequiredService<LedgerDbContext>();
+    db.Database.EnsureCreated();
+    db.Database.ExecuteSqlRaw("PRAGMA journal_mode='WAL';");
+}
 
 app.Use(async (context, next) =>
 {
@@ -123,5 +140,18 @@ app.MapGet("/api/audit/verify", (LedgerStore store) =>
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", service = "FintechLedgerApi" }));
 
 app.Run();
+
+static string ResolveSqliteConnectionString(string connectionString, string contentRootPath)
+{
+    const string prefix = "Data Source=";
+    if (!connectionString.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        return connectionString;
+
+    var path = connectionString[prefix.Length..].Trim();
+    if (Path.IsPathRooted(path))
+        return connectionString;
+
+    return prefix + Path.GetFullPath(Path.Combine(contentRootPath, path));
+}
 
 public partial class Program;

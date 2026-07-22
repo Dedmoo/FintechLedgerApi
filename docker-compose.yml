@@ -1,0 +1,13 @@
+services:
+  fintech-ledger-api:
+    build:
+      context: ./FintechLedger.Api
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8080"
+    volumes:
+      - fintech-ledger-data:/data
+    restart: unless-stopped
+
+volumes:
+  fintech-ledger-data:

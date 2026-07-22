@@ -1,20 +1,13 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using FintechLedger.Api.Data;
+using Microsoft.EntityFrameworkCore;
 
 namespace FintechLedger.Api.Domain;
 
-public sealed class LedgerStore
+public sealed class LedgerStore(LedgerDbContext db)
 {
-    private readonly object _gate = new();
-    private readonly Dictionary<string, Account> _accounts = new(StringComparer.Ordinal);
-    private readonly List<JournalEntry> _entries = [];
-    private readonly Dictionary<string, IdempotencyRecord> _idempotency = new(StringComparer.Ordinal);
-    private readonly List<AuditEvent> _audit = [];
-    private string _lastAuditHash = "GENESIS";
-
-    private sealed record IdempotencyRecord(string EntryId, string Fingerprint);
-
     public Account CreateAccount(string ownerName, string currency)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ownerName);
@@ -23,35 +16,28 @@ public sealed class LedgerStore
             throw new InvalidOperationException("Owner name must be at most 120 characters.");
         var ccy = Iso4217.NormalizeOrThrow(currency);
 
-        lock (_gate)
+        using var tx = db.Database.BeginTransaction();
+        var account = new Account
         {
-            var account = new Account
-            {
-                AccountId = $"ACC-{Guid.NewGuid():N}"[..16].ToUpperInvariant(),
-                OwnerName = trimmed,
-                Currency = ccy
-            };
-            _accounts[account.AccountId] = account;
-            WriteAudit("account.created", $"accountId={account.AccountId}; owner={account.OwnerName}; ccy={ccy}");
-            return account;
-        }
+            AccountId = $"ACC-{Guid.NewGuid():N}"[..16].ToUpperInvariant(),
+            OwnerName = trimmed,
+            Currency = ccy,
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        db.Accounts.Add(account);
+        WriteAudit("account.created", $"accountId={account.AccountId}; owner={account.OwnerName}; ccy={ccy}");
+        db.SaveChanges();
+        tx.Commit();
+        return account;
     }
 
-    public Account? GetAccount(string accountId)
-    {
-        lock (_gate)
-        {
-            return _accounts.TryGetValue(accountId, out var account) ? account : null;
-        }
-    }
+    public Account? GetAccount(string accountId) =>
+        db.Accounts.AsNoTracking().FirstOrDefault(a => a.AccountId == accountId);
 
     public decimal GetBalance(string accountId)
     {
-        lock (_gate)
-        {
-            EnsureAccount(accountId);
-            return BalanceUnlocked(accountId);
-        }
+        EnsureAccount(accountId);
+        return BalanceOf(accountId);
     }
 
     public TransferResult Fund(FundAccountRequest request)
@@ -61,40 +47,41 @@ public sealed class LedgerStore
             throw new InvalidOperationException("Funding amount must be greater than zero.");
         ValidateMoneyScale(request.Amount);
 
-        lock (_gate)
+        using var tx = db.Database.BeginTransaction();
+        var account = EnsureAccount(request.AccountId);
+        var fingerprint = Fingerprint("fund", account.AccountId, request.Amount.ToString(CultureInfo.InvariantCulture));
+        if (TryReplay("fund:", request.IdempotencyKey, fingerprint, out var replayedId))
         {
-            var account = EnsureAccount(request.AccountId);
-            var fingerprint = Fingerprint("fund", account.AccountId, request.Amount.ToString(CultureInfo.InvariantCulture));
-            if (TryReplay("fund:", request.IdempotencyKey, fingerprint, out var replayedId))
-            {
-                return new TransferResult(
-                    replayedId!,
-                    BalanceUnlocked(SystemClearingId(account.Currency)),
-                    BalanceUnlocked(account.AccountId),
-                    Replayed: true);
-            }
-
-            var clearingId = EnsureSystemClearing(account.Currency);
-            var entry = PostBalanced(
-                description: string.IsNullOrWhiteSpace(request.Description)
-                    ? $"Opening deposit {account.AccountId}"
-                    : request.Description.Trim(),
-                idempotencyKey: request.IdempotencyKey,
-                reversesEntryId: null,
-                new LedgerLine { AccountId = clearingId, Debit = 0m, Credit = request.Amount },
-                new LedgerLine { AccountId = account.AccountId, Debit = request.Amount, Credit = 0m });
-
-            RememberIdempotency("fund:", request.IdempotencyKey, fingerprint, entry.EntryId);
-            WriteAudit(
-                "account.funded",
-                $"entryId={entry.EntryId}; accountId={account.AccountId}; amount={request.Amount}");
-
+            tx.Commit();
             return new TransferResult(
-                entry.EntryId,
-                BalanceUnlocked(clearingId),
-                BalanceUnlocked(account.AccountId),
-                Replayed: false);
+                replayedId!,
+                BalanceOf(SystemClearingId(account.Currency)),
+                BalanceOf(account.AccountId),
+                Replayed: true);
         }
+
+        var clearingId = EnsureSystemClearing(account.Currency);
+        var entry = PostBalanced(
+            description: string.IsNullOrWhiteSpace(request.Description)
+                ? $"Opening deposit {account.AccountId}"
+                : request.Description.Trim(),
+            idempotencyKey: request.IdempotencyKey,
+            reversesEntryId: null,
+            new LedgerLine { AccountId = clearingId, Debit = 0m, Credit = request.Amount },
+            new LedgerLine { AccountId = account.AccountId, Debit = request.Amount, Credit = 0m });
+
+        RememberIdempotency("fund:", request.IdempotencyKey, fingerprint, entry.EntryId);
+        WriteAudit(
+            "account.funded",
+            $"entryId={entry.EntryId}; accountId={account.AccountId}; amount={request.Amount}");
+        db.SaveChanges();
+        tx.Commit();
+
+        return new TransferResult(
+            entry.EntryId,
+            BalanceOf(clearingId),
+            BalanceOf(account.AccountId),
+            Replayed: false);
     }
 
     public TransferResult Transfer(TransferRequest request)
@@ -106,174 +93,169 @@ public sealed class LedgerStore
         if (string.Equals(request.FromAccountId, request.ToAccountId, StringComparison.Ordinal))
             throw new InvalidOperationException("Source and destination accounts must differ.");
 
-        lock (_gate)
+        using var tx = db.Database.BeginTransaction();
+        var fingerprint = Fingerprint(
+            "xfer",
+            request.FromAccountId,
+            request.ToAccountId,
+            request.Amount.ToString(CultureInfo.InvariantCulture));
+        if (TryReplay("xfer:", request.IdempotencyKey, fingerprint, out var replayedId))
         {
-            var fingerprint = Fingerprint(
-                "xfer",
-                request.FromAccountId,
-                request.ToAccountId,
-                request.Amount.ToString(CultureInfo.InvariantCulture));
-            if (TryReplay("xfer:", request.IdempotencyKey, fingerprint, out var replayedId))
-            {
-                return new TransferResult(
-                    replayedId!,
-                    BalanceUnlocked(request.FromAccountId),
-                    BalanceUnlocked(request.ToAccountId),
-                    Replayed: true);
-            }
-
-            var from = EnsureAccount(request.FromAccountId);
-            var to = EnsureAccount(request.ToAccountId);
-            if (!string.Equals(from.Currency, to.Currency, StringComparison.Ordinal))
-                throw new InvalidOperationException("Currency mismatch between accounts.");
-
-            var fromBalance = BalanceUnlocked(from.AccountId);
-            if (fromBalance < request.Amount)
-                throw new InvalidOperationException("Insufficient funds.");
-
-            var entry = PostBalanced(
-                description: string.IsNullOrWhiteSpace(request.Description)
-                    ? $"Transfer {from.AccountId} -> {to.AccountId}"
-                    : request.Description.Trim(),
-                idempotencyKey: request.IdempotencyKey,
-                reversesEntryId: null,
-                new LedgerLine { AccountId = from.AccountId, Debit = 0m, Credit = request.Amount },
-                new LedgerLine { AccountId = to.AccountId, Debit = request.Amount, Credit = 0m });
-
-            RememberIdempotency("xfer:", request.IdempotencyKey, fingerprint, entry.EntryId);
-            WriteAudit(
-                "transfer.posted",
-                $"entryId={entry.EntryId}; from={from.AccountId}; to={to.AccountId}; amount={request.Amount}");
-
+            tx.Commit();
             return new TransferResult(
-                entry.EntryId,
-                BalanceUnlocked(from.AccountId),
-                BalanceUnlocked(to.AccountId),
-                Replayed: false);
+                replayedId!,
+                BalanceOf(request.FromAccountId),
+                BalanceOf(request.ToAccountId),
+                Replayed: true);
         }
+
+        var from = EnsureAccount(request.FromAccountId);
+        var to = EnsureAccount(request.ToAccountId);
+        if (!string.Equals(from.Currency, to.Currency, StringComparison.Ordinal))
+            throw new InvalidOperationException("Currency mismatch between accounts.");
+
+        var fromBalance = BalanceOf(from.AccountId);
+        if (fromBalance < request.Amount)
+            throw new InvalidOperationException("Insufficient funds.");
+
+        var entry = PostBalanced(
+            description: string.IsNullOrWhiteSpace(request.Description)
+                ? $"Transfer {from.AccountId} -> {to.AccountId}"
+                : request.Description.Trim(),
+            idempotencyKey: request.IdempotencyKey,
+            reversesEntryId: null,
+            new LedgerLine { AccountId = from.AccountId, Debit = 0m, Credit = request.Amount },
+            new LedgerLine { AccountId = to.AccountId, Debit = request.Amount, Credit = 0m });
+
+        RememberIdempotency("xfer:", request.IdempotencyKey, fingerprint, entry.EntryId);
+        WriteAudit(
+            "transfer.posted",
+            $"entryId={entry.EntryId}; from={from.AccountId}; to={to.AccountId}; amount={request.Amount}");
+        db.SaveChanges();
+        tx.Commit();
+
+        return new TransferResult(
+            entry.EntryId,
+            BalanceOf(from.AccountId),
+            BalanceOf(to.AccountId),
+            Replayed: false);
     }
 
-    /// <summary>
-    /// Append-only correction: posts a reversing journal that mirrors the original lines.
-    /// Posted history is never mutated.
-    /// </summary>
     public TransferResult Reverse(ReverseEntryRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentException.ThrowIfNullOrWhiteSpace(request.EntryId);
 
-        lock (_gate)
+        using var tx = db.Database.BeginTransaction();
+        var fingerprint = Fingerprint("rev", request.EntryId);
+        if (TryReplay("rev:", request.IdempotencyKey, fingerprint, out var replayedId))
         {
-            var fingerprint = Fingerprint("rev", request.EntryId);
-            if (TryReplay("rev:", request.IdempotencyKey, fingerprint, out var replayedId))
-            {
-                var original = _entries.First(e => e.EntryId == request.EntryId);
-                var a = original.Lines[0].AccountId;
-                var b = original.Lines[1].AccountId;
-                return new TransferResult(replayedId!, BalanceUnlocked(a), BalanceUnlocked(b), Replayed: true);
-            }
-
-            var source = _entries.FirstOrDefault(e => e.EntryId == request.EntryId)
-                ?? throw new KeyNotFoundException($"Journal entry not found: {request.EntryId}");
-            if (source.ReversesEntryId is not null)
-                throw new InvalidOperationException("Cannot reverse a reversing entry directly.");
-            if (_entries.Any(e => e.ReversesEntryId == source.EntryId))
-                throw new InvalidOperationException("Entry already reversed.");
-
-            var mirrored = source.Lines
-                .Select(l => new LedgerLine
-                {
-                    AccountId = l.AccountId,
-                    Debit = l.Credit,
-                    Credit = l.Debit
-                })
-                .ToArray();
-
-            var reason = string.IsNullOrWhiteSpace(request.Reason)
-                ? $"Reversal of {source.EntryId}"
-                : request.Reason.Trim();
-
-            var entry = PostBalanced(reason, request.IdempotencyKey, source.EntryId, mirrored);
-            RememberIdempotency("rev:", request.IdempotencyKey, fingerprint, entry.EntryId);
-            WriteAudit("transfer.reversed", $"entryId={entry.EntryId}; reverses={source.EntryId}");
-
-            return new TransferResult(
-                entry.EntryId,
-                BalanceUnlocked(mirrored[0].AccountId),
-                BalanceUnlocked(mirrored[1].AccountId),
-                Replayed: false);
+            var original = db.JournalEntries.Include(e => e.Lines)
+                .First(e => e.EntryId == request.EntryId);
+            var a = original.Lines[0].AccountId;
+            var b = original.Lines[1].AccountId;
+            tx.Commit();
+            return new TransferResult(replayedId!, BalanceOf(a), BalanceOf(b), Replayed: true);
         }
+
+        var source = db.JournalEntries.Include(e => e.Lines)
+                .FirstOrDefault(e => e.EntryId == request.EntryId)
+            ?? throw new KeyNotFoundException($"Journal entry not found: {request.EntryId}");
+        if (source.ReversesEntryId is not null)
+            throw new InvalidOperationException("Cannot reverse a reversing entry directly.");
+        if (db.JournalEntries.Any(e => e.ReversesEntryId == source.EntryId))
+            throw new InvalidOperationException("Entry already reversed.");
+
+        var mirrored = source.Lines
+            .Select(l => new LedgerLine
+            {
+                AccountId = l.AccountId,
+                Debit = l.Credit,
+                Credit = l.Debit
+            })
+            .ToArray();
+
+        var reason = string.IsNullOrWhiteSpace(request.Reason)
+            ? $"Reversal of {source.EntryId}"
+            : request.Reason.Trim();
+
+        var entry = PostBalanced(reason, request.IdempotencyKey, source.EntryId, mirrored);
+        RememberIdempotency("rev:", request.IdempotencyKey, fingerprint, entry.EntryId);
+        WriteAudit("transfer.reversed", $"entryId={entry.EntryId}; reverses={source.EntryId}");
+        db.SaveChanges();
+        tx.Commit();
+
+        return new TransferResult(
+            entry.EntryId,
+            BalanceOf(mirrored[0].AccountId),
+            BalanceOf(mirrored[1].AccountId),
+            Replayed: false);
     }
 
     public IReadOnlyList<StatementLine> GetStatement(string accountId)
     {
-        lock (_gate)
-        {
-            EnsureAccount(accountId);
-            var chronological = _entries
-                .Where(e => e.Lines.Any(l => l.AccountId == accountId))
-                .OrderBy(e => e.PostedAt)
-                .ThenBy(e => e.EntryId)
-                .ToList();
+        EnsureAccount(accountId);
+        var chronological = db.JournalEntries
+            .AsNoTracking()
+            .Include(e => e.Lines)
+            .Where(e => e.Lines.Any(l => l.AccountId == accountId))
+            .AsEnumerable()
+            .OrderBy(e => e.PostedAt)
+            .ThenBy(e => e.EntryId)
+            .ToList();
 
-            decimal running = 0m;
-            var lines = new List<StatementLine>(chronological.Count);
-            foreach (var entry in chronological)
+        decimal running = 0m;
+        var lines = new List<StatementLine>(chronological.Count);
+        foreach (var entry in chronological)
+        {
+            var line = entry.Lines.First(l => l.AccountId == accountId);
+            running += line.Debit - line.Credit;
+            lines.Add(new StatementLine
             {
-                var line = entry.Lines.First(l => l.AccountId == accountId);
-                running += line.Debit - line.Credit;
-                lines.Add(new StatementLine
-                {
-                    EntryId = entry.EntryId,
-                    PostedAt = entry.PostedAt,
-                    Description = entry.Description,
-                    Debit = line.Debit,
-                    Credit = line.Credit,
-                    RunningBalance = running,
-                    ReversesEntryId = entry.ReversesEntryId
-                });
-            }
-
-            lines.Reverse();
-            return lines;
+                EntryId = entry.EntryId,
+                PostedAt = entry.PostedAt,
+                Description = entry.Description,
+                Debit = line.Debit,
+                Credit = line.Credit,
+                RunningBalance = running,
+                ReversesEntryId = entry.ReversesEntryId
+            });
         }
+
+        lines.Reverse();
+        return lines;
     }
 
-    public IReadOnlyList<AuditEvent> GetAuditTrail()
-    {
-        lock (_gate)
-        {
-            return _audit.OrderByDescending(a => a.OccurredAt).ToList();
-        }
-    }
+    public IReadOnlyList<AuditEvent> GetAuditTrail() =>
+        db.AuditEvents.AsNoTracking()
+            .AsEnumerable()
+            .OrderByDescending(a => a.OccurredAt)
+            .ToList();
 
     public bool IsLedgerBalanced()
     {
-        lock (_gate)
-        {
-            var debit = _entries.SelectMany(e => e.Lines).Sum(l => l.Debit);
-            var credit = _entries.SelectMany(e => e.Lines).Sum(l => l.Credit);
-            return debit == credit;
-        }
+        var debit = db.LedgerLines.Sum(l => (decimal?)l.Debit) ?? 0m;
+        var credit = db.LedgerLines.Sum(l => (decimal?)l.Credit) ?? 0m;
+        return debit == credit;
     }
 
     public bool VerifyAuditChain()
     {
-        lock (_gate)
+        var previous = "GENESIS";
+        foreach (var evt in db.AuditEvents.AsNoTracking()
+                     .AsEnumerable()
+                     .OrderBy(a => a.OccurredAt)
+                     .ThenBy(a => a.EventId))
         {
-            var previous = "GENESIS";
-            foreach (var evt in _audit.OrderBy(a => a.OccurredAt).ThenBy(a => a.EventId))
-            {
-                if (!string.Equals(evt.PreviousHash, previous, StringComparison.Ordinal))
-                    return false;
-                var expected = Hash(previous + "|" + evt.Action + "|" + evt.Details + "|" + evt.OccurredAt.ToUnixTimeMilliseconds());
-                if (!string.Equals(evt.EventHash, expected, StringComparison.Ordinal))
-                    return false;
-                previous = evt.EventHash;
-            }
-
-            return true;
+            if (!string.Equals(evt.PreviousHash, previous, StringComparison.Ordinal))
+                return false;
+            var expected = Hash(previous + "|" + evt.Action + "|" + evt.Details + "|" + evt.OccurredAt.ToUnixTimeMilliseconds());
+            if (!string.Equals(evt.EventHash, expected, StringComparison.Ordinal))
+                return false;
+            previous = evt.EventHash;
         }
+
+        return true;
     }
 
     private JournalEntry PostBalanced(
@@ -287,16 +269,20 @@ public sealed class LedgerStore
         if (lines.Sum(l => l.Debit) != lines.Sum(l => l.Credit))
             throw new InvalidOperationException("Unbalanced journal entry.");
 
+        var entryId = $"JE-{Guid.NewGuid():N}"[..18].ToUpperInvariant();
+        foreach (var line in lines)
+            line.JournalEntryId = entryId;
+
         var entry = new JournalEntry
         {
-            EntryId = $"JE-{Guid.NewGuid():N}"[..18].ToUpperInvariant(),
+            EntryId = entryId,
             Description = description,
             PostedAt = DateTimeOffset.UtcNow,
             IdempotencyKey = idempotencyKey,
             ReversesEntryId = reversesEntryId,
-            Lines = lines
+            Lines = lines.ToList()
         };
-        _entries.Add(entry);
+        db.JournalEntries.Add(entry);
         return entry;
     }
 
@@ -307,7 +293,8 @@ public sealed class LedgerStore
             return false;
 
         var mapKey = prefix + key;
-        if (!_idempotency.TryGetValue(mapKey, out var record))
+        var record = db.IdempotencyRecords.FirstOrDefault(r => r.MapKey == mapKey);
+        if (record is null)
             return false;
         if (!string.Equals(record.Fingerprint, fingerprint, StringComparison.Ordinal))
             throw new InvalidOperationException("Idempotency key reused with a different payload.");
@@ -319,7 +306,12 @@ public sealed class LedgerStore
     {
         if (string.IsNullOrWhiteSpace(key))
             return;
-        _idempotency[prefix + key] = new IdempotencyRecord(entryId, fingerprint);
+        db.IdempotencyRecords.Add(new IdempotencyRecord
+        {
+            MapKey = prefix + key,
+            EntryId = entryId,
+            Fingerprint = fingerprint
+        });
     }
 
     private static string Fingerprint(params string[] parts) =>
@@ -331,19 +323,16 @@ public sealed class LedgerStore
             throw new InvalidOperationException("Amount must have at most two decimal places.");
     }
 
-    private decimal BalanceUnlocked(string accountId)
+    private decimal BalanceOf(string accountId)
     {
-        var debit = _entries.SelectMany(e => e.Lines).Where(l => l.AccountId == accountId).Sum(l => l.Debit);
-        var credit = _entries.SelectMany(e => e.Lines).Where(l => l.AccountId == accountId).Sum(l => l.Credit);
+        var debit = db.LedgerLines.Where(l => l.AccountId == accountId).Sum(l => (decimal?)l.Debit) ?? 0m;
+        var credit = db.LedgerLines.Where(l => l.AccountId == accountId).Sum(l => (decimal?)l.Credit) ?? 0m;
         return debit - credit;
     }
 
-    private Account EnsureAccount(string accountId)
-    {
-        if (!_accounts.TryGetValue(accountId, out var account))
-            throw new KeyNotFoundException($"Account not found: {accountId}");
-        return account;
-    }
+    private Account EnsureAccount(string accountId) =>
+        db.Accounts.FirstOrDefault(a => a.AccountId == accountId)
+        ?? throw new KeyNotFoundException($"Account not found: {accountId}");
 
     private static string SystemClearingId(string currency) =>
         $"SYS-CLEARING-{currency}";
@@ -351,14 +340,15 @@ public sealed class LedgerStore
     private string EnsureSystemClearing(string currency)
     {
         var id = SystemClearingId(currency);
-        if (!_accounts.ContainsKey(id))
+        if (!db.Accounts.Any(a => a.AccountId == id))
         {
-            _accounts[id] = new Account
+            db.Accounts.Add(new Account
             {
                 AccountId = id,
                 OwnerName = "System Clearing",
-                Currency = currency
-            };
+                Currency = currency,
+                CreatedAt = DateTimeOffset.UtcNow
+            });
             WriteAudit("account.created", $"accountId={id}; owner=System Clearing");
         }
 
@@ -367,19 +357,25 @@ public sealed class LedgerStore
 
     private void WriteAudit(string action, string details)
     {
+        var state = db.AuditChainStates.FirstOrDefault(s => s.Id == 1);
+        if (state is null)
+        {
+            state = new AuditChainState { Id = 1, LastHash = "GENESIS" };
+            db.AuditChainStates.Add(state);
+        }
+
         var occurred = DateTimeOffset.UtcNow;
-        var eventHash = Hash(_lastAuditHash + "|" + action + "|" + details + "|" + occurred.ToUnixTimeMilliseconds());
-        var evt = new AuditEvent
+        var eventHash = Hash(state.LastHash + "|" + action + "|" + details + "|" + occurred.ToUnixTimeMilliseconds());
+        db.AuditEvents.Add(new AuditEvent
         {
             EventId = Guid.NewGuid().ToString("N"),
             Action = action,
             Details = details,
             OccurredAt = occurred,
-            PreviousHash = _lastAuditHash,
+            PreviousHash = state.LastHash,
             EventHash = eventHash
-        };
-        _audit.Add(evt);
-        _lastAuditHash = eventHash;
+        });
+        state.LastHash = eventHash;
     }
 
     private static string Hash(string input)
